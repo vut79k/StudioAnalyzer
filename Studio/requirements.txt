@@ -1,0 +1,7 @@
+selenium
+webdriver-manager
+gspread
+oauth2client
+customtkinter
+matplotlib
+reportlab

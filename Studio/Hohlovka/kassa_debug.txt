@@ -1,0 +1,422 @@
+# main.py
+import re
+import time
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+
+import gspread
+import gspread.exceptions
+from oauth2client.service_account import ServiceAccountCredentials
+from transformers import pipeline
+
+# --- Google Sheets ---
+scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+creds = ServiceAccountCredentials.from_json_keyfile_name('google_key.json', scope)
+client = gspread.authorize(creds)
+
+FIN_ID = '1lgn068NObnej5A0J0Ya4Kxz5JY6tptxKf9dZTf2VXrI'
+KASSA_ID = '1biAzb8vVeaTsClkozuViWdxqQ10Bo5NI93SLtvZy1bk'
+
+months_ru = {
+    'January': 'Январь','February': 'Февраль','March': 'Март','April': 'Апрель',
+    'May': 'Май','June': 'Июнь','July': 'Июль','August': 'Август',
+    'September': 'Сентябрь','October': 'Октябрь','November': 'Ноябрь','December': 'Декабрь'
+}
+
+# For September
+sheet_name = 'Сентябрь25'
+
+# Open workbook and get or create worksheet
+workbook = client.open_by_key(FIN_ID)
+try:
+    itogi_sheet = workbook.worksheet(sheet_name)
+except gspread.exceptions.WorksheetNotFound:
+    itogi_sheet = workbook.add_worksheet(title=sheet_name, rows=100, cols=50)
+
+# Kassa for September
+kassa_sheet = client.open_by_key(KASSA_ID).worksheet(sheet_name)
+
+def column_to_letter(n: int) -> str:
+    result = []
+    while n > 0:
+        n -= 1
+        result.append(chr(n % 26 + ord('A')))
+        n //= 26
+    return ''.join(reversed(result))
+
+# --- Canonical mapping (expanded) ---
+RAW_MAPPING = {
+    'фотошкола занятия': 'school_class',
+    'фотошкола домашние работы студентов': 'school_homework',
+    'фотошкол': 'school_class',
+    'фотосъемка': 'photo',
+    'фотосъемк': 'photo',
+    'фотосъёмк': 'photo',
+    'фото съемк': 'photo',
+    'фото': 'photo',
+    'банкет': 'banquet',
+    'видео съемк': 'video_master',
+    'видеосъемк': 'video_master',
+    'видеосьемк': 'video_master',
+    'мастеркласс': 'video_master',
+    'мастер класс': 'video_master',
+    'мероприятие бланк': 'event_blank',
+    'мероприятие сися': 'event_sisia_white',
+    'сися': 'event_sisia_white',
+    'white studios': 'event_sisia_white',
+    'yauza_place': 'yauza_place',
+    'yauza': 'yauza_place',
+    'yauz': 'yauza_place',
+    'crystal': 'crystal',
+    'корпоративные клиенты': 'corporate',
+    'корпоратив': 'corporate',
+    'корп': 'corporate',
+    'плавающая бронь': 'floating',
+    'плавающ': 'floating',
+    'не приехали/не приедут': 'no_show',
+    'не приех': 'no_show',
+    'не приедут': 'no_show',
+    'тех.бронь': 'tech',
+    'тех бронь': 'tech',
+    'тех': 'tech',
+    'техническ': 'tech',
+    'мероприяти': 'event',
+    'мероприятия': 'event'
+}
+DOP_KEYS = ['парковк','цикло','циклорама','фон','улице','доп','парк']
+
+# build ordered list of mapping keys sorted by length desc to prefer long/precise matches
+ORDERED_KEYS = sorted(RAW_MAPPING.keys(), key=lambda s: len(s), reverse=True)
+
+# --- Parsers and classifiers ---
+def extract_start_end(text: str):
+    t = re.sub(r'\s+', ' ', text).lower()
+    m = re.search(r'(?:с|c)\s*(\d{1,2}:\d{2}).*?до\s*(\d{1,2}:\d{2})', t)
+    if not m:
+        return None, None
+    s, e = m.group(1), m.group(2)
+    if len(s) == 4: s = '0' + s
+    if len(e) == 4: e = '0' + e
+    return s, e
+
+def extract_declared_hours_and_nextline(popup_text: str):
+    lines = [ln.strip() for ln in popup_text.splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        m = re.search(r'кол-?во\s*часов[:\s]*([\d]+)', low) or re.search(r'количество\s+часов[:\s]*([\d]+)', low)
+        if m:
+            hours = None
+            try:
+                hours = int(m.group(1))
+            except:
+                hours = None
+            next_line = lines[i+1].strip().lower() if i+1 < len(lines) else None
+            return hours, next_line
+    return None, None
+
+def classify_from_text(popup_text: str):
+    low = popup_text.lower()
+    # 1) use declared next line if present (ordered keys)
+    _, next_line = extract_declared_hours_and_nextline(popup_text)
+    if next_line:
+        for k in ORDERED_KEYS:
+            if k in next_line:
+                return RAW_MAPPING[k]
+    # 2) scan full text using ordered keys (prefer longer matches)
+    for k in ORDERED_KEYS:
+        if k in low:
+            return RAW_MAPPING[k]
+    # 3) dop priority
+    for k in DOP_KEYS:
+        if k in low:
+            return 'dop'
+    # 4) conservative heuristics fallback
+    if any(x in low for x in ['видео','мастер','мастеркласс']):
+        return 'video_master'
+    if any(x in low for x in ['школ','занятия','домашние']):
+        return 'school_homework' if 'домаш' in low or 'домашние' in low else 'school_class'
+    if any(x in low for x in ['корпор','корп']):
+        return 'corporate'
+    if any(x in low for x in ['мероприяти','yauza','crystal','сися','white studios']):
+        return 'event_sisia_white' if any(y in low for y in ['сися','white studios']) else 'event'
+    if 'floating' in low:
+        return 'floating'
+    if 'no_show' in low:
+        return 'no_show'
+    if 'tech' in low:
+        return 'tech'
+    return 'unknown'
+
+classifier = pipeline("zero-shot-classification", model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli")
+
+# --- Setup browser ---
+chrome_options = webdriver.ChromeOptions()
+chrome_options.binary_location = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+service = Service(ChromeDriverManager().install())
+driver = webdriver.Chrome(service=service, options=chrome_options)
+
+try:
+    # Login
+    driver.get("https://whitestudios.ru/reservator/login/")
+    login_field = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.NAME, "login")))
+    password_field = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.NAME, "pass")))
+    login_field.send_keys("Kapr")
+    password_field.send_keys("vut79k")
+    driver.find_element(By.CSS_SELECTOR, 'input[type="submit"]').click()
+    time.sleep(5)
+
+    main_url = driver.current_url
+
+    # Process all days in September
+    for day in range(1, 31):
+        current_date_str = f"{day:02d}.09.2025"
+        print(f"Processing day {current_date_str}")
+
+        try:
+            # Load Yauza for the day
+            driver.execute_script(f"showStudio(32, '{current_date_str}');")
+            time.sleep(10)  # Increased sleep
+
+            studio_body = WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.ID, "studioBody32")))
+            WebDriverWait(driver, 20).until(lambda x: len(studio_body.text.strip()) > 0)
+
+            # Collect all bookings
+            bookings = driver.find_elements(By.CSS_SELECTOR, '#studioBody32 .reserved')
+
+            hrefs = set()
+            for booking in bookings:
+                try:
+                    link = booking.find_element(By.TAG_NAME, "a")
+                    href = link.get_attribute("href")
+                    if href:
+                        hrefs.add(href)
+                except:
+                    continue
+
+            # Daily totals
+            daily_hours_totals = defaultdict(float)
+            daily_counts = defaultdict(int)
+            daily_total_prepayment = defaultdict(int)
+            daily_total_fakt = defaultdict(int)
+            daily_parking_amount = 0
+            daily_parking_count = 0
+
+            for href in hrefs:
+                try:
+                    driver.get(href)
+                    time.sleep(3)
+
+                    popup_text = driver.find_element(By.TAG_NAME, "body").text
+                    print(f"Popup text for {href}: {popup_text[:200]}...")  # Debug
+
+                    if "Яуза" not in popup_text:
+                        driver.get(main_url)
+                        time.sleep(1)
+                        continue
+
+                    cls = classify_from_text(popup_text)
+
+                    if cls == "unknown" and "Не приехали" in popup_text:
+                        cls = "no_show"
+
+                    if cls == "unknown":
+                        classification = classifier(popup_text, candidate_labels=["фотосъемка", "видеосъемка", "фотошкола", "мероприятие", "yauza_place", "парковка"])
+                        label = classification['labels'][0].lower()
+                        score = classification['scores'][0]
+                        if score > 0.6:
+                            if "фотосъемка" in label:
+                                cls = "photo"
+                            elif "видеосъемка" in label:
+                                cls = "video_master"
+                            elif "фотошкола" in label:
+                                cls = "school_class"
+                            elif "мероприятие" in label:
+                                cls = "event"
+                            elif "yauza_place" in label:
+                                cls = "yauza_place"
+                            elif "парковка" in label:
+                                cls = "dop"
+
+                    # Hours
+                    declared_hours, next_line = extract_declared_hours_and_nextline(popup_text)
+                    hours = declared_hours if declared_hours else 0
+
+                    if hours == 0:
+                        start_str, end_str = extract_start_end(popup_text)
+                        if start_str and end_str:
+                            start = datetime.strptime(start_str, '%H:%M')
+                            end = datetime.strptime(end_str, '%H:%M')
+                            if end < start:
+                                end += timedelta(days=1)
+                            hours = (end - start).total_seconds() / 3600
+
+                    daily_hours_totals[cls] += hours
+                    daily_counts[cls] += 1
+
+                    print(f"Бронь {href}: {cls}, {hours} ч")
+
+                    # Prepayment
+                    lines = popup_text.splitlines()
+                    prepayment = 0
+                    for line in lines:
+                        if "Оплата с сайта" in line:
+                            digits = re.findall(r'\d+', line)
+                            if digits:
+                                prepayment = int(digits[0])
+                            break
+
+                    if cls in ["photo", "video_master", "school_class", "school_homework", "corporate"]:
+                        daily_total_prepayment[cls] += prepayment
+
+                    driver.get(main_url)
+                    time.sleep(1)
+
+                except Exception as e:
+                    print(f"Error processing {href}: {e}")
+                    driver.get(main_url)
+                    time.sleep(1)
+
+            # Kassa for the day
+            kassa_data = kassa_sheet.get_all_values()
+            for row in kassa_data[1:]:  # Skip header
+                if len(row) < 4: continue
+                date_cell = row[0].strip()
+                print(f"Kassa row date: {date_cell}")  # Debug
+                if date_cell != current_date_str:
+                    continue
+
+                amount_b = row[1].strip()
+                amount_d = row[3].strip()
+                amount_str = amount_b if amount_b.startswith('р.') else amount_d if amount_d.startswith('р.') else ''
+                if amount_str:
+                    try:
+                        amount = int(re.sub(r'[^\d]', '', amount_str))
+                    except:
+                        continue
+                else:
+                    continue
+
+                if amount < 0:
+                    continue  # Skip negative
+
+                desc = ' '.join(row[4:]).lower()
+                if 'яуза' not in desc:
+                    continue
+
+                if any(k in desc for k in DOP_KEYS):
+                    daily_total_fakt['dop'] += amount
+                    if 'парковк' in desc or 'парк' in desc:
+                        daily_parking_amount += amount
+                        daily_parking_count += 1
+                    continue
+
+                if 'выручка' in desc:
+                    if 'фото' in desc:
+                        daily_total_fakt['photo'] += amount
+                        continue
+                    if 'видео' in desc or 'мастер' in desc:
+                        daily_total_fakt['video_master'] += amount
+                        continue
+                    if any(x in desc for x in ['школа','фотошкол','занятия','домашние работы']):
+                        daily_total_fakt['school_class'] += amount
+                        continue
+                    if 'корпоратив' in desc:
+                        daily_total_fakt['corporate'] += amount
+                        continue
+
+                # ML fallback
+                cls = classifier(desc, candidate_labels=[
+                    "оплата за бронь фото студии","оплата за банкет","оплата за видео/мастер класс",
+                    "оплата за фотошколу","оплата за корпоратив","оплата парковки","дополнительная услуга"
+                ])
+                lab = cls['labels'][0].lower()
+                sc = cls['scores'][0]
+                if sc > 0.6:
+                    if 'фото' in lab:
+                        daily_total_fakt['photo'] += amount
+                    elif 'банкет' in lab:
+                        daily_total_fakt['banquet'] += amount
+                    elif 'видео' in lab or 'мастер' in lab:
+                        daily_total_fakt['video_master'] += amount
+                    elif 'фотошкол' in lab:
+                        daily_total_fakt['school_class'] += amount
+                    elif 'корпоратив' in lab:
+                        daily_total_fakt['corporate'] += amount
+                    elif 'парков' in lab or 'парков' in desc:
+                        daily_total_fakt['dop'] += amount
+                        daily_parking_amount += amount
+                        daily_parking_count += 1
+                    else:
+                        daily_total_fakt['dop'] += amount
+
+            # School money for the day
+            daily_school_money = int(daily_hours_totals.get('school_class', 0.0) + daily_hours_totals.get('school_homework', 0.0)) * 600
+
+            # Output for the day
+            def pr(name, key):
+                h = round(daily_hours_totals.get(key, 0.0), 2)
+                c = daily_counts.get(key, 0)
+                print(f"{name}: {h} ч (бронирований: {c})")
+
+            print(f"Day {current_date_str}:")
+            pr("Фотосъемка", "photo")
+            pr("Банкет", "banquet")
+            pr("Видео съемки/Мастер класс", "video_master")
+            pr("Фотошкола занятия", "school_class")
+            pr("Фотошкола домашние работы", "school_homework")
+            pr("Корпоративные клиенты", "corporate")
+            pr("Мероприятие", "event")
+            pr("Мероприятие бланк", "event_blank")
+            pr("Мероприятие Сися и White Studios", "event_sisia_white")
+            pr("Мероприятия yauza_place", "yauza_place")
+            pr("Мероприятия crystal", "crystal")
+            pr("Плавающая бронь", "floating")
+            pr("Не приехали/не приедут", "no_show")
+            pr("Тех.бронь", "tech")
+            pr("Неопределённые", "unknown")
+
+            print("Предоплаты по типам:")
+            for k, v in daily_total_prepayment.items():
+                print(f"  {k}: {v} руб.")
+            print("По факту по типам:")
+            for k, v in daily_total_fakt.items():
+                print(f"  {k}: {v} руб.")
+
+            print(f"Парковки сумма: {daily_parking_amount} руб.; кол-во: {daily_parking_count}")
+            print(f"Школа по часам: {daily_school_money} руб.")
+
+            col_num = day + 1  # B for 1, etc.
+            col = column_to_letter(col_num)
+
+            print("Обновления для дня:")
+            print(f"{col}26: {daily_total_prepayment.get('photo', 0)}")
+            print(f"{col}28: {daily_total_fakt.get('photo', 0)}")
+            print(f"{col}30: {daily_total_prepayment.get('video_master', 0)}")
+            print(f"{col}32: {daily_total_fakt.get('video_master', 0)}")
+            print(f"{col}34: {daily_school_money}")
+            print(f"{col}36: {daily_total_fakt.get('dop', 0)}")
+
+            confirm = input(f"Записать для дня {current_date_str}? (yes/no): ").strip().lower()
+            if confirm == 'yes':
+                itogi_sheet.update_acell(f"{col}26", daily_total_prepayment.get('photo', 0))
+                itogi_sheet.update_acell(f"{col}28", daily_total_fakt.get('photo', 0))
+                itogi_sheet.update_acell(f"{col}30", daily_total_prepayment.get('video_master', 0))
+                itogi_sheet.update_acell(f"{col}32", daily_total_fakt.get('video_master', 0))
+                itogi_sheet.update_acell(f"{col}34", daily_school_money)
+                itogi_sheet.update_acell(f"{col}36", daily_total_fakt.get('dop', 0))
+                print(f"Записано для дня {current_date_str}.")
+            else:
+                print(f"Отменено для дня {current_date_str}.")
+
+except Exception as e:
+    print(f"Ошибка: {e}")
+
+finally:
+    driver.quit()
